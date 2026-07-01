@@ -1,0 +1,4 @@
+# ROS2 워크스페이스 불필요 파일 제외
+log/
+build/
+install/
