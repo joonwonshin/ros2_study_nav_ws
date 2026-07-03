@@ -16,10 +16,11 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
+from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
-BOXES_CLASS_NAME = 'car-amr'  # 좌표(Detection2DArray)는 이 클래스만 발행
+BOXES_CLASS_NAME = 'Car'  # 좌표(Detection2DArray)는 이 클래스만 발행
 
 
 class YOLOImageSubscriber(Node):
@@ -45,9 +46,15 @@ class YOLOImageSubscriber(Node):
             10)
 
         # bbox 좌표(픽셀) 발행. compressed(rgb)와 stereo(depth) 해상도가 동일해 리사이즈 불필요
-        self.boxes_publisher = self.create_publisher(
-            Detection2DArray,
-            '/yolo/detection/amr/boxes',
+        # self.boxes_publisher = self.create_publisher(
+        #     Detection2DArray,
+        #     '/yolo/detection/amr/boxes',
+        #     10)
+
+        # 중심점(픽셀)만 발행
+        self.center_publisher = self.create_publisher(
+            PointStamped,
+            '/yolo/detection/amr/center',
             10)
 
         # 탐지 루프를 별도 스레드에서 실행 (메인 스레드는 spin_once 전용)
@@ -76,8 +83,8 @@ class YOLOImageSubscriber(Node):
 
             # compressed(rgb)와 stereo(depth) 해상도가 동일하므로 리사이즈 없이 좌표를 그대로 사용
             stamp = self.get_clock().now().to_msg()
-            detections_msg = Detection2DArray()
-            detections_msg.header.stamp = stamp
+            # detections_msg = Detection2DArray()
+            # detections_msg.header.stamp = stamp
 
             results = self.model.predict(img, stream=True, verbose=False)
             for r in results:
@@ -94,24 +101,31 @@ class YOLOImageSubscriber(Node):
 
                     # 좌표(Detection2D)는 BOXES_CLASS_NAME 클래스만 발행 -> detection_depth.py가 이 좌표로 depth 조회
                     if str(self.classNames[cls]) == BOXES_CLASS_NAME:
-                        det = Detection2D()
-                        det.header.stamp = stamp
-                        det.bbox.center.position.x = (x1 + x2) / 2.0
-                        det.bbox.center.position.y = (y1 + y2) / 2.0
-                        det.bbox.size_x = float(x2 - x1)
-                        det.bbox.size_y = float(y2 - y1)
-                        hypothesis = ObjectHypothesisWithPose()
-                        hypothesis.hypothesis.class_id = str(self.classNames[cls])
-                        hypothesis.hypothesis.score = conf
-                        det.results.append(hypothesis)
-                        detections_msg.detections.append(det)
+                        # det = Detection2D()
+                        # det.header.stamp = stamp
+                        # det.bbox.center.position.x = (x1 + x2) / 2.0
+                        # det.bbox.center.position.y = (y1 + y2) / 2.0
+                        # det.bbox.size_x = float(x2 - x1)
+                        # det.bbox.size_y = float(y2 - y1)
+                        # hypothesis = ObjectHypothesisWithPose()
+                        # hypothesis.hypothesis.class_id = str(self.classNames[cls])
+                        # hypothesis.hypothesis.score = conf
+                        # det.results.append(hypothesis)
+                        # detections_msg.detections.append(det)
+
+                        center_msg = PointStamped()
+                        center_msg.header.stamp = stamp
+                        center_msg.point.x = (x1 + x2) / 2.0
+                        center_msg.point.y = (y1 + y2) / 2.0
+                        center_msg.point.z = 0.0
+                        self.center_publisher.publish(center_msg)
 
             try:
                 out_msg = self.bridge.cv2_to_compressed_imgmsg(img, dst_format='jpg')
                 # out_msg.header.stamp = self.get_clock().now().to_msg()
                 out_msg.header.stamp = stamp
                 self.detection_publisher.publish(out_msg)
-                self.boxes_publisher.publish(detections_msg)
+                # self.boxes_publisher.publish(detections_msg)
             except Exception as e:
                 self.get_logger().error(f"Publish failed: {e}")
 
