@@ -1,9 +1,13 @@
+from enum import Enum, auto
+
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.time import Time
 
+from std_msgs.msg import Bool
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
 
@@ -16,7 +20,23 @@ from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Navigator, Turt
 import numpy as np
 import cv2
 import threading
+import time
 import math
+
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+# amr_flag가 True가 되면 이동할 좌표/방향
+WEST_APPROACH_POSITION = [-2.7257, 0.3193]
+WEST_APPROACH_DIRECTION = TurtleBot4Directions.WEST
+
+# 물체와의 (depth 기준) 거리가 이 값 이하가 되면 접근을 멈추고 현재 Nav2 목표를 취소 (m)
+STOP_DISTANCE = 0.5
+
+
+class State(Enum):
+    WAIT_FLAG = auto()   # /yolo/detection/amr_flag == True 대기
+    MOVING = auto()       # 서쪽 접근 지점으로 이동 중
+    DETECT = auto()       # AMR 탐지 및 접근 수행 중
 
 
 class DepthToMap(Node):
@@ -35,18 +55,74 @@ class DepthToMap(Node):
         self.depth_image = None
         self.rgb_image = None
         self.detected_point = None      # YOLO에서 받은 픽셀 좌표 (x, y)
-        self.new_detection = False      # 새 탐지가 도착했는지 여부 (goal 중복 전송 방지)
-        self.shutdown_requested = False
-        self.display_image = None
 
-        # self.gui_thread_stop = threading.Event()
-        # self.gui_thread = threading.Thread(target=self.gui_loop, daemon=True)
-        # self.gui_thread.start()
+        self.state = State.WAIT_FLAG
+        self.detect_prepared = False
+        self.goal_sent = False           # 접근 목표를 이미 한 번 보냈는지 여부
+        self.approach_done = False      # STOP_DISTANCE 이내 도달 후 접근 종료 여부
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.navigator = TurtleBot4Navigator()
+
+        self.logged_intrinsics = False
+        self.logged_rgb_shape = False
+        self.logged_depth_shape = False
+
+        self.create_subscription(CameraInfo, self.info_topic, self.camera_info_callback, 1)
+
+        # RGB/Depth를 타임스탬프 기준으로 동기화해서 함께 수신
+        self.rgb_sub = Subscriber(self, CompressedImage, self.rgb_topic)
+        self.depth_sub = Subscriber(self, Image, self.depth_topic)
+        self.ts = ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub],
+            queue_size=10,
+            slop=0.1
+        )
+        self.ts.registerCallback(self.synced_callback)
+
+        # YOLO 탐지 중심점 구독
+        self.create_subscription(
+            PointStamped,
+            '/yolo/detection/amr/center',
+            self.detection_callback,
+            10
+        )
+
+        # AMR 탐지 여부 플래그 구독 (True가 되면 서쪽 접근 지점으로 이동)
+        self.create_subscription(
+            Bool,
+            '/yolo/detection/amr_flag',
+            self.amr_flag_callback,
+            10
+        )
+
+        # 상태별 실행을 담당하는 메인 루프. 단일 콜백 그룹으로 묶어 중복 실행을 막는다.
+        self.state_cb_group = MutuallyExclusiveCallbackGroup()
+        self.create_timer(0.2, self.state_tick, callback_group=self.state_cb_group)
+
+        self.get_logger().info("AMR 탐지 플래그 대기 중...")
+
+    def amr_flag_callback(self, msg: Bool):
+        """ 플래그 수신 시 상태만 변경. 실제 이동/탐지 실행은 state_tick에서 처리 """
+        with self.lock:
+            if self.state != State.WAIT_FLAG or not msg.data:
+                return
+            self.state = State.MOVING
+        self.get_logger().info("AMR 탐지 플래그 수신. 이동을 시작합니다.")
+
+    def state_tick(self):
+        with self.lock:
+            state = self.state
+
+        if state == State.MOVING:
+            self.handle_moving()
+        elif state == State.DETECT:
+            self.handle_detect()
+
+    def handle_moving(self):
+        self.get_logger().info("도킹 상태를 확인하고 초기 pose를 설정합니다.")
         if not self.navigator.getDockedStatus():
             self.get_logger().info('Docking before initializing pose')
             self.navigator.dock()
@@ -56,29 +132,22 @@ class DepthToMap(Node):
         self.navigator.waitUntilNav2Active()
         self.navigator.undock()
 
-        self.logged_intrinsics = False
-        self.logged_rgb_shape = False
-        self.logged_depth_shape = False
+        self.get_logger().info("서쪽 접근 지점으로 이동합니다.")
+        goal_pose = self.navigator.getPoseStamped(WEST_APPROACH_POSITION, WEST_APPROACH_DIRECTION)
+        self.navigator.startToPose(goal_pose)
 
-        self.create_subscription(CameraInfo, self.info_topic, self.camera_info_callback, 1)
-        self.create_subscription(Image, self.depth_topic, self.depth_callback, 1)
-        self.create_subscription(CompressedImage, self.rgb_topic, self.rgb_callback, 1)
+        with self.lock:
+            self.state = State.DETECT
+        self.get_logger().info("접근 지점 도착.")
 
-        # YOLO 탐지 중심점 구독 (마우스 클릭 대체)
-        self.create_subscription(
-            PointStamped,
-            '/yolo/detection/amr/center',
-            self.detection_callback,
-            10
-        )
-
-        self.get_logger().info("TF Tree 안정화 시작. 5초 후 변환 시작합니다.")
-        self.start_timer = self.create_timer(5.0, self.start_transform)
-
-    def start_transform(self):
-        self.get_logger().info("TF Tree 안정화 완료. 변환 시작합니다.")
-        self.timer = self.create_timer(0.2, self.display_images)
-        self.start_timer.cancel()
+    def handle_detect(self):
+        # 5초 TF 안정화 대기(최초 1회)만 담당. 실제 탐지 처리는 detection_callback에서
+        # 새 탐지 메시지가 도착하는 즉시 실행되어 좌표 staleness를 없앤다.
+        if not self.detect_prepared:
+            self.detect_prepared = True
+            self.get_logger().info("TF Tree 안정화 시작. 5초 후 AMR 탐지를 시작합니다.")
+            time.sleep(5.0)
+            self.get_logger().info("TF Tree 안정화 완료. AMR 탐지를 시작합니다.")
 
     def camera_info_callback(self, msg):
         with self.lock:
@@ -89,131 +158,134 @@ class DepthToMap(Node):
                 )
                 self.logged_intrinsics = True
 
-    def depth_callback(self, msg):
+    def synced_callback(self, rgb_msg, depth_msg):
+        """ RGB와 Depth가 타임스탬프 기준으로 동기화되어 함께 도착했을 때 호출 """
         try:
-            depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            if depth is not None and depth.size > 0:
-                if not self.logged_depth_shape:
-                    self.get_logger().info(f"Depth image received: {depth.shape}")
-                    self.logged_depth_shape = True
-                with self.lock:
-                    self.depth_image = depth
-                    self.camera_frame = msg.header.frame_id
-        except Exception as e:
-            self.get_logger().error(f"Depth CV bridge conversion failed: {e}")
-
-    def rgb_callback(self, msg):
-        try:
-            np_arr = np.frombuffer(msg.data, np.uint8)
+            np_arr = np.frombuffer(rgb_msg.data, np.uint8)
             rgb = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            if rgb is not None and rgb.size > 0:
-                if not self.logged_rgb_shape:
-                    self.get_logger().info(f"RGB image decoded: {rgb.shape}")
-                    self.logged_rgb_shape = True
-                with self.lock:
+            if rgb is not None and rgb.size > 0 and not self.logged_rgb_shape:
+                self.get_logger().info(f"RGB image decoded: {rgb.shape}")
+                self.logged_rgb_shape = True
+
+            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            if depth is not None and depth.size > 0 and not self.logged_depth_shape:
+                self.get_logger().info(f"Depth image received: {depth.shape}")
+                self.logged_depth_shape = True
+
+            with self.lock:
+                if rgb is not None and rgb.size > 0:
                     self.rgb_image = rgb
+                if depth is not None and depth.size > 0:
+                    self.depth_image = depth
+                    self.camera_frame = depth_msg.header.frame_id
         except Exception as e:
-            self.get_logger().error(f"Compressed RGB decode failed: {e}")
+            self.get_logger().error(f"Synced callback failed: {e}")
 
     def detection_callback(self, msg: PointStamped):
-        """ YOLO 탐지 중심점(픽셀 좌표) 수신 """
+        """ YOLO 탐지 중심점(픽셀 좌표) 수신 즉시 처리 (staleness 방지) """
         x = int(msg.point.x)
         y = int(msg.point.y)
         with self.lock:
             self.detected_point = (x, y)
-            self.new_detection = True   # 새 탐지 도착 표시
-        self.get_logger().info(f"Detected AMR center pixel: ({x}, {y})")
+            ready = (
+                self.state == State.DETECT
+                and self.detect_prepared
+                and not self.approach_done
+            )
+        if ready:
+            self.process_detection((x, y))
 
-    def display_images(self):
+    def get_patch_distance(self, depth, x, y, half_size=5):
+        """ (x, y) 주변 패치의 median depth로 거리를 계산해 단일 픽셀 노이즈를 줄인다 """
+        h, w = depth.shape[:2]
+        y0, y1 = max(0, y - half_size), min(h, y + half_size)
+        x0, x1 = max(0, x - half_size), min(w, x + half_size)
+        patch = depth[y0:y1, x0:x1]
+        valid = patch[patch > 0]  # 0 (측정 실패) 제외
+        if valid.size == 0:
+            return None
+        return float(np.median(valid)) / 1000.0
+
+    def process_detection(self, point):
         with self.lock:
-            rgb = self.rgb_image.copy() if self.rgb_image is not None else None
+            if self.approach_done:
+                return
             depth = self.depth_image.copy() if self.depth_image is not None else None
-            point = self.detected_point
-            is_new = self.new_detection
             frame_id = getattr(self, 'camera_frame', None)
+            goal_sent = self.goal_sent
 
-        if rgb is not None and depth is not None and frame_id:
-            try:
-                # rgb_display = rgb.copy()
-                # depth_display = depth.copy()
-                # depth_normalized = cv2.normalize(depth_display, None, 0, 255, cv2.NORM_MINMAX)
-                # depth_colored = cv2.applyColorMap(depth_normalized.astype(np.uint8), cv2.COLORMAP_JET)
+        if depth is None or frame_id is None:
+            return
 
-                if point is not None:
-                    x, y = point
-                    if 0 <= x < depth.shape[1] and 0 <= y < depth.shape[0]:
-                        z = float(depth[y, x]) / 1000.0
+        try:
+            x, y = point
+            if not (0 <= x < depth.shape[1] and 0 <= y < depth.shape[0]):
+                return
 
-                        if 0.2 < z < 5.0 and is_new:
-                            fx, fy = self.K[0, 0], self.K[1, 1]
-                            cx, cy = self.K[0, 2], self.K[1, 2]
+            # z = float(depth[y, x]) / 1000.0
+            z = self.get_patch_distance(depth, x, y)
+            if z is None or not (0.2 < z < 5.0):
+                return
 
-                            X = (x - cx) * z / fx
-                            Y = (y - cy) * z / fy
-                            Z = z
+            self.get_logger().info(f"물체와의 거리: {z:.2f} m")
 
-                            pt_camera = PointStamped()
-                            pt_camera.header.stamp = Time().to_msg()
-                            pt_camera.header.frame_id = frame_id
-                            pt_camera.point.x = X
-                            pt_camera.point.y = Y
-                            pt_camera.point.z = Z
+            if z <= STOP_DISTANCE:
+                self.navigator.cancelTask()
+                with self.lock:
+                    self.approach_done = True
+                self.get_logger().info(f"정지 거리({STOP_DISTANCE} m) 도달. 접근을 종료합니다.")
+                return
 
-                            pt_map = self.tf_buffer.transform(pt_camera, 'map', timeout=Duration(seconds=1.0))
-                            self.get_logger().info(
-                                f"Map coordinate: ({pt_map.point.x:.2f}, {pt_map.point.y:.2f}, {pt_map.point.z:.2f})"
-                            )
+            if goal_sent:
+                # 목표는 이미 한 번 보냈으므로 거리만 계속 확인하고 재전송하지 않는다
+                return
 
-                            goal_pose = PoseStamped()
-                            goal_pose.header.frame_id = 'map'
-                            goal_pose.header.stamp = self.get_clock().now().to_msg()
-                            goal_pose.pose.position.x = pt_map.point.x
-                            goal_pose.pose.position.y = pt_map.point.y
-                            goal_pose.pose.position.z = 0.0
-                            yaw = 0.0
-                            qz = math.sin(yaw / 2.0)
-                            qw = math.cos(yaw / 2.0)
-                            goal_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=qz, w=qw)
+            fx, fy = self.K[0, 0], self.K[1, 1]
+            cx, cy = self.K[0, 2], self.K[1, 2]
 
-                            self.navigator.goToPose(goal_pose)
-                            self.get_logger().info("Sent navigation goal to detected AMR map coordinate.")
+            X = (x - cx) * z / fx
+            Y = (y - cy) * z / fy
+            Z = z
 
-                            with self.lock:
-                                self.new_detection = False   # 같은 탐지로 재전송되지 않도록 플래그 내림
+            pt_camera = PointStamped()
+            pt_camera.header.stamp = Time().to_msg()
+            pt_camera.header.frame_id = frame_id
+            pt_camera.point.x = X
+            pt_camera.point.y = Y
+            pt_camera.point.z = Z
 
-                        pass
-                        # cv2.circle(rgb_display, (x, y), 4, (0, 255, 0), -1)
-                        # text = f"{z:.2f} m" if 0.2 < z < 5.0 else "Invalid"
-                        # cv2.putText(depth_colored, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        # cv2.circle(depth_colored, (x, y), 4, (255, 255, 255), -1)
+            pt_map = self.tf_buffer.transform(pt_camera, 'map', timeout=Duration(seconds=1.0))
 
-                # combined = np.hstack((rgb_display, depth_colored))
-                # with self.lock:
-                #     self.display_image = combined.copy()
-            except Exception as e:
-                self.get_logger().warn(f"TF or goal error: {e}")
+            # 카메라(로봇) 현재 위치를 map 좌표계로 변환해 물체를 바라보는 yaw 계산
+            robot_origin = PointStamped()
+            robot_origin.header.stamp = Time().to_msg()
+            robot_origin.header.frame_id = frame_id
+            robot_origin.point.x = 0.0
+            robot_origin.point.y = 0.0
+            robot_origin.point.z = 0.0
+            robot_pos_map = self.tf_buffer.transform(robot_origin, 'map', timeout=Duration(seconds=1.0))
 
-    # def gui_loop(self):
-    #     """ 결과 뷰어만 표시 (클릭 입력 없음) """
-    #     cv2.namedWindow('RGB (left) | Depth (right)', cv2.WINDOW_NORMAL)
-    #     cv2.resizeWindow('RGB (left) | Depth (right)', 1280, 480)
-    #     cv2.moveWindow('RGB (left) | Depth (right)', 100, 100)
-    #
-    #     while not self.gui_thread_stop.is_set():
-    #         with self.lock:
-    #             img = self.display_image.copy() if self.display_image is not None else None
-    #
-    #         if img is not None:
-    #             cv2.imshow('RGB (left) | Depth (right)', img)
-    #             key = cv2.waitKey(1)
-    #             if key == ord('q'):
-    #                 self.get_logger().info("Shutdown requested by user (via GUI).")
-    #                 self.navigator.dock()
-    #                 self.shutdown_requested = True
-    #                 self.gui_thread_stop.set()
-    #                 rclpy.shutdown()
-    #         else:
-    #             cv2.waitKey(10)
+            yaw = math.atan2(
+                pt_map.point.y - robot_pos_map.point.y,
+                pt_map.point.x - robot_pos_map.point.x
+            )
+
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = 'map'
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+            goal_pose.pose.position.x = pt_map.point.x
+            goal_pose.pose.position.y = pt_map.point.y
+            goal_pose.pose.position.z = 0.0
+            qz = math.sin(yaw / 2.0)
+            qw = math.cos(yaw / 2.0)
+            goal_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=qz, w=qw)
+
+            self.navigator.goToPose(goal_pose)
+            with self.lock:
+                self.goal_sent = True
+            self.get_logger().info("최초 목표를 물체 위치로 전송했습니다. 이후 거리만 계속 확인합니다.")
+        except Exception as e:
+            self.get_logger().warn(f"TF or goal error: {e}")
 
 
 ROBOT_NAMESPACE = 'robot2'
@@ -234,10 +306,7 @@ def main():
         executor.spin()
     except KeyboardInterrupt:
         pass
-    # node.gui_thread_stop.set()
-    # node.gui_thread.join()
     node.destroy_node()
-    # cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
