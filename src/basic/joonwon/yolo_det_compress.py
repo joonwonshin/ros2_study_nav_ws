@@ -86,7 +86,7 @@ class YOLOImageSubscriber(Node):
             # detections_msg = Detection2DArray()
             # detections_msg.header.stamp = stamp
 
-            results = self.model.predict(img, stream=True, verbose=False)
+            results = self.model.predict(img, stream=True, verbose=False, conf=0.5)
             for r in results:
                 if not hasattr(r, 'boxes') or r.boxes is None:
                     continue
