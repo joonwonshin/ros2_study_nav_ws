@@ -8,13 +8,12 @@ from rclpy.duration import Duration
 from rclpy.time import Time
 
 from std_msgs.msg import Bool
-from sensor_msgs.msg import Image, CameraInfo, CompressedImage
+from sensor_msgs.msg import CameraInfo, CompressedImage
 from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
 
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
 from tf2_ros import Buffer, TransformListener
 
-from cv_bridge import CvBridge
 from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Navigator, TurtleBot4Directions
 
 import numpy as np
@@ -22,6 +21,7 @@ import cv2
 import threading
 import time
 import math
+import struct
 
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
@@ -30,7 +30,7 @@ WEST_APPROACH_POSITION = [-2.7257, 0.3193]
 WEST_APPROACH_DIRECTION = TurtleBot4Directions.WEST
 
 # 물체와의 (depth 기준) 거리가 이 값 이하가 되면 접근을 멈추고 현재 Nav2 목표를 취소 (m)
-STOP_DISTANCE = 0.5
+STOP_DISTANCE = 0.8
 
 
 class State(Enum):
@@ -43,12 +43,11 @@ class DepthToMap(Node):
     def __init__(self):
         super().__init__('depth_to_map_node')
 
-        self.bridge = CvBridge()
         self.K = None
         self.lock = threading.Lock()
 
         ns = self.get_namespace()
-        self.depth_topic = f'{ns}/oakd/stereo/image_raw'
+        self.depth_topic = f'{ns}/oakd/stereo/image_raw/compressedDepth'
         self.rgb_topic = f'{ns}/oakd/rgb/image_raw/compressed'
         self.info_topic = f'{ns}/oakd/rgb/camera_info'
 
@@ -74,7 +73,7 @@ class DepthToMap(Node):
 
         # RGB/Depth를 타임스탬프 기준으로 동기화해서 함께 수신
         self.rgb_sub = Subscriber(self, CompressedImage, self.rgb_topic)
-        self.depth_sub = Subscriber(self, Image, self.depth_topic)
+        self.depth_sub = Subscriber(self, CompressedImage, self.depth_topic)
         self.ts = ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
             queue_size=10,
@@ -158,6 +157,25 @@ class DepthToMap(Node):
                 )
                 self.logged_intrinsics = True
 
+    def decode_compressed_depth(self, msg: CompressedImage):
+        """ compressed_depth_image_transport 포맷(12바이트 헤더 + PNG) 디코딩
+        헤더 = int32 format + float depthParam[2] (총 12바이트) """
+        header_size = 12
+        _fmt_flag, depth_quant_a, depth_quant_b = struct.unpack('<iff', bytes(msg.data[:header_size]))
+        raw_data = np.frombuffer(bytes(msg.data[header_size:]), dtype=np.uint8)
+        decompressed = cv2.imdecode(raw_data, cv2.IMREAD_UNCHANGED)
+        if decompressed is None:
+            return None
+
+        depth_fmt = msg.format.split(';')[0].strip()
+        if depth_fmt == '32FC1':
+            depth = np.zeros(decompressed.shape, dtype=np.float32)
+            valid = decompressed != 0
+            depth[valid] = depth_quant_a / (decompressed[valid].astype(np.float32) - depth_quant_b)
+            depth[~valid] = np.nan
+            return depth
+        return decompressed  # 16UC1: mm 단위 raw depth (기존 처리와 동일)
+
     def synced_callback(self, rgb_msg, depth_msg):
         """ RGB와 Depth가 타임스탬프 기준으로 동기화되어 함께 도착했을 때 호출 """
         try:
@@ -167,7 +185,7 @@ class DepthToMap(Node):
                 self.get_logger().info(f"RGB image decoded: {rgb.shape}")
                 self.logged_rgb_shape = True
 
-            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            depth = self.decode_compressed_depth(depth_msg)
             if depth is not None and depth.size > 0 and not self.logged_depth_shape:
                 self.get_logger().info(f"Depth image received: {depth.shape}")
                 self.logged_depth_shape = True
