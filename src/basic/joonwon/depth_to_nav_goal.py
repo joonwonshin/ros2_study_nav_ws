@@ -247,17 +247,6 @@ class DepthToMap(Node):
 
             self.get_logger().info(f"물체와의 거리: {z:.2f} m")
 
-            if z <= STOP_DISTANCE:
-                self.navigator.cancelTask()
-                with self.lock:
-                    self.approach_done = True
-                self.get_logger().info(f"정지 거리({STOP_DISTANCE} m) 도달. 접근을 종료합니다.")
-                return
-
-            if goal_sent:
-                # 목표는 이미 한 번 보냈으므로 거리만 계속 확인하고 재전송하지 않는다
-                return
-
             fx, fy = self.K[0, 0], self.K[1, 1]
             cx, cy = self.K[0, 2], self.K[1, 2]
 
@@ -287,6 +276,30 @@ class DepthToMap(Node):
                 pt_map.point.y - robot_pos_map.point.y,
                 pt_map.point.x - robot_pos_map.point.x
             )
+            qz = math.sin(yaw / 2.0)
+            qw = math.cos(yaw / 2.0)
+
+            if z <= STOP_DISTANCE:
+                # 기존 목표를 취소하고, 로봇 현재 위치는 그대로 둔 채 물체 방향으로만 정렬한다
+                self.navigator.cancelTask()
+
+                face_pose = PoseStamped()
+                face_pose.header.frame_id = 'map'
+                face_pose.header.stamp = self.get_clock().now().to_msg()
+                face_pose.pose.position.x = robot_pos_map.point.x
+                face_pose.pose.position.y = robot_pos_map.point.y
+                face_pose.pose.position.z = 0.0
+                face_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=qz, w=qw)
+
+                self.navigator.goToPose(face_pose)
+                with self.lock:
+                    self.approach_done = True
+                self.get_logger().info(f"정지 거리({STOP_DISTANCE} m) 도달. 목표를 취소하고 물체 방향으로 정렬합니다.")
+                return
+
+            if goal_sent:
+                # 목표는 이미 한 번 보냈으므로 거리만 계속 확인하고 재전송하지 않는다
+                return
 
             goal_pose = PoseStamped()
             goal_pose.header.frame_id = 'map'
@@ -294,8 +307,6 @@ class DepthToMap(Node):
             goal_pose.pose.position.x = pt_map.point.x
             goal_pose.pose.position.y = pt_map.point.y
             goal_pose.pose.position.z = 0.0
-            qz = math.sin(yaw / 2.0)
-            qw = math.cos(yaw / 2.0)
             goal_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=qz, w=qw)
 
             self.navigator.goToPose(goal_pose)
