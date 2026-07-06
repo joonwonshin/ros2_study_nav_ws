@@ -30,7 +30,7 @@ WEST_APPROACH_POSITION = [-2.7257, 0.3193]
 WEST_APPROACH_DIRECTION = TurtleBot4Directions.WEST
 
 # 물체와의 (depth 기준) 거리가 이 값 이하가 되면 접근을 멈추고 현재 Nav2 목표를 취소 (m)
-STOP_DISTANCE = 0.8
+STOP_DISTANCE = 1.0
 
 
 class State(Enum):
@@ -242,7 +242,8 @@ class DepthToMap(Node):
 
             # z = float(depth[y, x]) / 1000.0
             z = self.get_patch_distance(depth, x, y)
-            if z is None or not (0.2 < z < 5.0):
+            if z is None or not (0.2 < z < 10.0):
+                self.get_logger().warn(f"거리 유효범위 벗어남: z={z}")
                 return
 
             self.get_logger().info(f"물체와의 거리: {z:.2f} m")
